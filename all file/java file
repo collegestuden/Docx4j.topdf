@@ -1,0 +1,645 @@
+package org.example;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+
+/**
+ * Main class for the QuickDraft application.
+ * This application reads data from an Excel file, processes a Word document by replacing placeholders,
+ * and generates PDFs for each processed entry.
+ */
+public class QuickDraft {
+    private static final Logger logger = LoggerFactory.getLogger(QuickDraft.class);
+    private static final String OUTPUT_DIR = ConfigUtil.getProperty("output.dir");
+
+    /**
+     * Main method to execute the QuickDraft application.
+     * Steps:
+     * 1. Reads Excel data from "today" and "default" sheets using ExcelReader.
+     * 2. Processes a Word document using WordReader, replacing placeholders with Excel data.
+     * 3. Converts the modified Word documents to PDFs using GeneratePDF.
+     * 4. Saves the generated PDFs to the output directory.
+     *
+     * @param args command-line arguments (not used)
+     */
+    public static void main(String[] args) {
+        // Format the current date and time (09:22 PM IST, Sunday, June 15, 2025)
+        LocalDateTime now = LocalDateTime.of(2025, 6, 15, 21, 22);
+        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("dd-MMM-yyyy hh:mm:ss a z");
+        String formattedDateTime = now.atZone(ZoneId.of("Asia/Kolkata")).format(formatter);
+        logger.info("Starting QuickDraft application at: {}", formattedDateTime);
+
+        try {
+            // Step 1: Ensure output directory exists
+            File outputDirFile = new File(OUTPUT_DIR);
+            if (!outputDirFile.exists()) {
+                outputDirFile.mkdirs();
+                logger.info("Created output directory: {}", OUTPUT_DIR);
+            }
+
+            // Step 2: Read Excel data
+            logger.debug("Initializing ExcelReader to read data");
+            ExcelReader excelReader = new ExcelReader();
+            Map<String, List<String>> dataMap = excelReader.readExcelData();
+            List<String> headers = excelReader.getHeaders();
+            List<String> defaultHeaders = excelReader.getDefaultHeaders();
+            List<String> defaultValues = excelReader.getDefaultValues();
+
+            // Log the data for debugging
+            logger.info("Excel data mapped successfully:");
+            logger.info("Headers (today sheet): {}", headers);
+            logger.info("Default Headers (default sheet): {}", defaultHeaders);
+            logger.info("Default Values (default sheet): {}", defaultValues);
+            for (Entry<String, List<String>> entry : dataMap.entrySet()) {
+                logger.info("Data row - ID {}: {}", entry.getKey(), entry.getValue());
+            }
+
+            // Step 3: Process Word document
+            logger.debug("Initializing WordReader to process Word document");
+            WordReader wordProcessor = new WordReader();
+            List<Entry<String, String>> modifiedFiles = wordProcessor.processWordDocument(
+                    dataMap, headers, defaultHeaders, defaultValues);
+
+            // Step 4: Convert to PDF
+            logger.debug("Initializing GeneratePDF to convert Word documents to PDFs");
+            GeneratePDF pdfGenerator = new GeneratePDF();
+            List<Entry<String, byte[]>> pdfContents = pdfGenerator.convertToPDF(modifiedFiles);
+
+            // Step 5: Save the generated PDFs to the output directory
+            logger.debug("Saving generated PDFs to output directory: {}", OUTPUT_DIR);
+            for (Entry<String, byte[]> entry : pdfContents) {
+                String id = entry.getKey();
+                byte[] pdfBytes = entry.getValue();
+                File pdfFile = new File(OUTPUT_DIR, id + ".pdf");
+
+                try (FileOutputStream fos = new FileOutputStream(pdfFile)) {
+                    fos.write(pdfBytes);
+                    fos.flush();
+                    logger.info("Saved PDF for ID {} to: {}", id, pdfFile.getAbsolutePath());
+                } catch (IOException e) {
+                    logger.error("Failed to save PDF for ID {}: {}", id, e.getMessage(), e);
+                    throw new IOException("Failed to save PDF for ID " + id, e);
+                }
+            }
+
+            logger.info("PDF generation completed successfully at: {}", formattedDateTime);
+            System.out.println("PDF generation completed successfully at: " + formattedDateTime);
+
+        } catch (Exception e) {
+            logger.error("Error processing files at {}: {}", formattedDateTime, e.getMessage(), e);
+            System.err.println("Error processing files at " + formattedDateTime + ": " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+}
+--------------------------------------------------------
+package org.example;
+
+import org.apache.poi.xwpf.usermodel.*;
+import org.docx4j.openpackaging.packages.WordprocessingMLPackage;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.*;
+import java.util.AbstractMap;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Class responsible for reading and processing a Word document template.
+ * Replaces placeholders with data from "today" and "default" sheets, and prepares the document for PDF conversion.
+ */
+public class WordReader {
+    private static final Logger logger = LoggerFactory.getLogger(WordReader.class);
+    private final String wordPath = ConfigUtil.getProperty("word.path");
+    private final String outputDir = ConfigUtil.getProperty("output.dir");
+
+    /**
+     * Processes the Word document by replacing placeholders and saves the modified document.
+     *
+     * @param excelData      Map of ID to list of values from the "today" sheet
+     * @param headers        Headers from the "today" sheet
+     * @param defaultHeaders Headers from the "default" sheet
+     * @param defaultValues  Values from the "default" sheet
+     * @return List of entries mapping ID to the path of the modified Word document
+     * @throws IOException if an I/O error occurs
+     */
+    public List<Map.Entry<String, String>> processWordDocument(Map<String, List<String>> excelData, List<String> headers,
+            List<String> defaultHeaders, List<String> defaultValues) throws IOException {
+        // Suppress POI warning for unsupported SAX feature
+        System.setProperty("org.apache.poi.javax.xml.transform.TransformerFactory", "com.sun.org.apache.xalan.internal.xsltc.trax.TransformerFactoryImpl");
+
+        List<Map.Entry<String, String>> modifiedFiles = new ArrayList<>();
+
+        // Ensure output directory exists
+        File outputDirFile = new File(outputDir);
+        if (!outputDirFile.exists()) {
+            outputDirFile.mkdirs();
+            logger.info("Created output directory: {}", outputDir);
+        }
+
+        // Step 1: Read the Word document and validate placeholders
+        logger.debug("Reading Word document template from: {}", wordPath);
+        StringBuilder allText = new StringBuilder();
+        try (FileInputStream fis = new FileInputStream(wordPath);
+             XWPFDocument doc = new XWPFDocument(fis)) {
+
+            // Collect text from headers
+            for (XWPFHeader header : doc.getHeaderList()) {
+                String headerText = header.getText();
+                if (headerText != null && !headerText.trim().isEmpty()) {
+                    allText.append(headerText).append(" ");
+                }
+            }
+
+            // Collect text from footers
+            for (XWPFFooter footer : doc.getFooterList()) {
+                String footerText = footer.getText();
+                if (footerText != null && !footerText.trim().isEmpty()) {
+                    allText.append(footerText).append(" ");
+                }
+            }
+
+            // Collect text from the main body (paragraphs and tables)
+            for (IBodyElement element : doc.getBodyElements()) {
+                if (element instanceof XWPFParagraph) {
+                    XWPFParagraph paragraph = (XWPFParagraph) element;
+                    String text = paragraph.getText();
+                    if (text != null && !text.trim().isEmpty()) {
+                        allText.append(text).append(" ");
+                    }
+                }
+                if (element instanceof XWPFTable) {
+                    XWPFTable table = (XWPFTable) element;
+                    for (XWPFTableRow row : table.getRows()) {
+                        for (XWPFTableCell cell : row.getTableCells()) {
+                            String cellText = cell.getText();
+                            if (cellText != null && !cellText.trim().isEmpty()) {
+                                allText.append(cellText).append(" ");
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            logger.error("Failed to read Word document template at {}: {}", wordPath, e.getMessage(), e);
+            throw new IOException("Failed to read Word document template", e);
+        }
+
+        // Validate placeholders
+        List<String> allHeaders = new ArrayList<>();
+        allHeaders.add("ID");
+        allHeaders.addAll(headers);
+        allHeaders.addAll(defaultHeaders);
+        String allTextString = allText.toString();
+        for (String header : allHeaders) {
+            String placeholder = "<$" + header + "$>";
+            if (!allTextString.contains(placeholder)) {
+                logger.warn("Placeholder '{}' for header '{}' not found in the Word document.", placeholder, header);
+            } else {
+                logger.debug("Found placeholder '{}' in the Word document.", placeholder);
+            }
+        }
+
+        // Step 2: Process each Excel row and replace placeholders
+        for (Map.Entry<String, List<String>> entry : excelData.entrySet()) {
+            String id = entry.getKey();
+            List<String> values = entry.getValue();
+
+            // Define file path for the modified Word document
+            String wordFilePath = outputDir + "modified_" + id + ".docx";
+            File wordFile = new File(wordFilePath);
+
+            // Replace placeholders and save the modified Word document
+            logger.debug("Processing Word document for ID: {}", id);
+            try (FileInputStream fis = new FileInputStream(wordPath);
+                 XWPFDocument doc = new XWPFDocument(fis);
+                 FileOutputStream fos = new FileOutputStream(wordFile)) {
+
+                // Process headers
+                for (XWPFHeader header : doc.getHeaderList()) {
+                    for (XWPFParagraph paragraph : header.getParagraphs()) {
+                        replacePlaceholdersInParagraph(paragraph, id, headers, values, defaultHeaders, defaultValues);
+                    }
+                }
+
+                // Process the main body (paragraphs and tables)
+                for (IBodyElement element : doc.getBodyElements()) {
+                    if (element instanceof XWPFParagraph) {
+                        XWPFParagraph paragraph = (XWPFParagraph) element;
+                        replacePlaceholdersInParagraph(paragraph, id, headers, values, defaultHeaders, defaultValues);
+                    }
+                    if (element instanceof XWPFTable) {
+                        XWPFTable table = (XWPFTable) element;
+                        for (XWPFTableRow row : table.getRows()) {
+                            for (XWPFTableCell cell : row.getTableCells()) {
+                                for (XWPFParagraph paragraph : cell.getParagraphs()) {
+                                    replacePlaceholdersInParagraph(paragraph, id, headers, values, defaultHeaders, defaultValues);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Process footers
+                for (XWPFFooter footer : doc.getFooterList()) {
+                    for (XWPFParagraph paragraph : footer.getParagraphs()) {
+                        replacePlaceholdersInParagraph(paragraph, id, headers, values, defaultHeaders, defaultValues);
+                    }
+                }
+
+                // Save the modified Word document
+                logger.debug("Saving modified Word document to: {}", wordFile.getAbsolutePath());
+                doc.write(fos);
+                modifiedFiles.add(new AbstractMap.SimpleEntry<>(id, wordFilePath));
+            } catch (Exception e) {
+                logger.error("Error saving modified Word document for ID {}: {}", id, e.getMessage(), e);
+                throw new IOException("Failed to save modified Word document for ID " + id, e);
+            }
+        }
+
+        return modifiedFiles;
+    }
+
+    /**
+     * Replaces placeholders in a paragraph with actual values from Excel data, preserving alignment and font properties.
+     *
+     * @param paragraph       the paragraph to process
+     * @param id              the ID value for replacement
+     * @param headers         headers from the "today" sheet
+     * @param values          values from the "today" sheet for the current row
+     * @param defaultHeaders  headers from the "default" sheet
+     * @param defaultValues   values from the "default" sheet
+     */
+    private void replacePlaceholdersInParagraph(XWPFParagraph paragraph, String id, List<String> headers,
+            List<String> values, List<String> defaultHeaders, List<String> defaultValues) {
+        String text = paragraph.getText();
+        if (text == null || text.trim().isEmpty()) {
+            return;
+        }
+
+        // Log the original text for debugging
+        logger.debug("Original text in paragraph: {}", text);
+
+        // Preserve the original alignment and font properties
+        ParagraphAlignment alignment = paragraph.getAlignment();
+        String fontFamily = null;
+        int fontSize = -1;
+        java.awt.Color fontColor = null;
+
+        if (!paragraph.getRuns().isEmpty()) {
+            XWPFRun firstRun = paragraph.getRuns().get(0);
+            fontFamily = firstRun.getFontFamily();
+            fontSize = firstRun.getFontSize();
+            fontColor = firstRun.getColor() != null ? hexToColor(firstRun.getColor()) : java.awt.Color.BLACK;
+        }
+
+        String updatedText = text;
+        // Replace "today" sheet placeholders
+        if (updatedText.contains("<$ID$>")) {
+            updatedText = updatedText.replace("<$ID$>", id);
+            logger.debug("Replaced placeholder '<$ID$>' with '{}'", id);
+        }
+        for (int i = 0; i < headers.size() && i < values.size(); i++) {
+            String placeholder = "<$" + headers.get(i) + "$>";
+            if (updatedText.contains(placeholder)) {
+                updatedText = updatedText.replace(placeholder, values.get(i));
+                logger.debug("Replaced placeholder '{}' with '{}'", placeholder, values.get(i));
+            }
+        }
+        // Replace "default" sheet placeholders
+        for (int i = 0; i < defaultHeaders.size() && i < defaultValues.size(); i++) {
+            String placeholder = "<$" + defaultHeaders.get(i) + "$>";
+            String value = defaultValues.get(i);
+            if (updatedText.contains(placeholder)) {
+                updatedText = updatedText.replace(placeholder, value);
+                logger.debug("Replaced placeholder '{}' with '{}'", placeholder, value);
+            }
+        }
+
+        // Log the updated text for debugging
+        logger.debug("Updated text in paragraph: {}", updatedText);
+
+        // Clear existing runs in the paragraph
+        while (paragraph.getRuns().size() > 0) {
+            paragraph.removeRun(0);
+        }
+
+        // Add the updated text as a new run with preserved properties
+        XWPFRun run = paragraph.createRun();
+        run.setText(updatedText);
+        if (fontFamily != null) {
+            run.setFontFamily(fontFamily);
+        }
+        if (fontSize != -1) {
+            run.setFontSize(fontSize);
+        }
+        if (fontColor != null) {
+            run.setColor(colorToHex(fontColor));
+        }
+
+        // Reapply the original alignment
+        paragraph.setAlignment(alignment);
+    }
+
+    /**
+     * Converts a hex color string (e.g., "000000") to a java.awt.Color object.
+     *
+     * @param hexColor the hex color string
+     * @return the corresponding Color object
+     */
+    private java.awt.Color hexToColor(String hexColor) {
+        try {
+            return new java.awt.Color(
+                    Integer.parseInt(hexColor.substring(0, 2), 16),
+                    Integer.parseInt(hexColor.substring(2, 4), 16),
+                    Integer.parseInt(hexColor.substring(4, 6), 16)
+            );
+        } catch (Exception e) {
+            logger.warn("Failed to parse hex color '{}', defaulting to black: {}", hexColor, e.getMessage());
+            return java.awt.Color.BLACK;
+        }
+    }
+
+    /**
+     * Converts a java.awt.Color object to a hex color string (e.g., "000000").
+     *
+     * @param color the Color object
+     * @return the hex color string
+     */
+    private String colorToHex(java.awt.Color color) {
+        return String.format("%02X%02X%02X", color.getRed(), color.getGreen(), color.getBlue());
+    }
+}
+-------------------------------------------------
+package org.example;
+
+import org.apache.poi.ss.usermodel.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.util.*;
+
+/**
+ * Class responsible for reading data from an Excel file.
+ * Reads the "today" sheet for per-row data and the "default" sheet for default values.
+ */
+public class ExcelReader {
+    private static final Logger logger = LoggerFactory.getLogger(ExcelReader.class);
+    private final String excelPath = ConfigUtil.getProperty("excel.path");
+
+    private List<String> headers;
+    private List<String> defaultHeaders;
+    private List<String> defaultValues;
+    private Map<String, List<String>> excelData;
+
+    /**
+     * Reads data from the Excel file.
+     *
+     * @return Map of ID to list of values from the "today" sheet
+     * @throws IOException if an I/O error occurs
+     */
+    public Map<String, List<String>> readExcelData() throws IOException {
+        excelData = new HashMap<>();
+        headers = new ArrayList<>();
+        defaultHeaders = new ArrayList<>();
+        defaultValues = new ArrayList<>();
+
+        logger.info("Reading Excel file from: {}", excelPath);
+        try (FileInputStream fis = new FileInputStream(excelPath);
+             Workbook workbook = WorkbookFactory.create(fis)) {
+
+            // Read the "today" sheet
+            Sheet todaySheet = workbook.getSheet("today");
+            if (todaySheet == null) {
+                throw new IOException("Sheet 'today' not found in Excel file");
+            }
+
+            Iterator<Row> rowIterator = todaySheet.iterator();
+            if (!rowIterator.hasNext()) {
+                throw new IOException("Sheet 'today' is empty");
+            }
+
+            // Read headers from the first row
+            Row headerRow = rowIterator.next();
+            for (int i = 1; i < headerRow.getLastCellNum(); i++) { // Skip ID column
+                Cell cell = headerRow.getCell(i);
+                String header = (cell != null ? cell.toString().trim() : "");
+                headers.add(header);
+            }
+
+            // Read data rows
+            while (rowIterator.hasNext()) {
+                Row row = rowIterator.next();
+                Cell idCell = row.getCell(0); // ID column
+                if (idCell == null || idCell.toString().trim().isEmpty()) {
+                    continue;
+                }
+                String id = idCell.toString().trim();
+                List<String> values = new ArrayList<>();
+                for (int i = 1; i < row.getLastCellNum(); i++) {
+                    Cell cell = row.getCell(i);
+                    values.add(cell != null ? cell.toString().trim() : "");
+                }
+                excelData.put(id, values);
+            }
+
+            // Read the "default" sheet
+            Sheet defaultSheet = workbook.getSheet("default");
+            if (defaultSheet == null) {
+                throw new IOException("Sheet 'default' not found in Excel file");
+            }
+
+            rowIterator = defaultSheet.iterator();
+            if (!rowIterator.hasNext()) {
+                throw new IOException("Sheet 'default' is empty");
+            }
+
+            // Read the first row as headers
+            Row defaultHeaderRow = rowIterator.next();
+            for (Cell cell : defaultHeaderRow) {
+                String header = (cell != null ? cell.toString().trim() : "");
+                defaultHeaders.add(header);
+            }
+
+            // Read the second row as values
+            if (!rowIterator.hasNext()) {
+                throw new IOException("Sheet 'default' does not contain a values row");
+            }
+            Row defaultValuesRow = rowIterator.next();
+            for (Cell cell : defaultValuesRow) {
+                String value = (cell != null ? cell.toString().trim() : "");
+                defaultValues.add(value);
+            }
+
+            // Ensure headers and values have the same size
+            while (defaultValues.size() < defaultHeaders.size()) {
+                defaultValues.add(""); // Pad with empty strings if values are fewer than headers
+            }
+            while (defaultHeaders.size() < defaultValues.size()) {
+                defaultHeaders.add(""); // Pad with empty strings if headers are fewer than values
+            }
+        } catch (Exception e) {
+            logger.error("Failed to read Excel file at {}: {}", excelPath, e.getMessage(), e);
+            throw new IOException("Failed to read Excel file", e);
+        }
+
+        return excelData;
+    }
+
+    /**
+     * Gets the headers from the "today" sheet (excluding ID).
+     *
+     * @return List of headers
+     */
+    public List<String> getHeaders() {
+        return headers;
+    }
+
+    /**
+     * Gets the headers from the "default" sheet.
+     *
+     * @return List of default headers
+     */
+    public List<String> getDefaultHeaders() {
+        return defaultHeaders;
+    }
+
+    /**
+     * Gets the values from the "default" sheet.
+     *
+     * @return List of default values
+     */
+    public List<String> getDefaultValues() {
+        return defaultValues;
+    }
+}
+--------------------------------------------
+package org.example;
+
+import org.docx4j.Docx4J;
+import org.docx4j.openpackaging.packages.WordprocessingMLPackage;
+import org.docx4j.fonts.IdentityPlusMapper;
+import org.docx4j.fonts.PhysicalFonts;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.*;
+import java.util.AbstractMap;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Class responsible for converting Word documents to PDFs using Docx4J.
+ */
+public class GeneratePDF {
+    private static final Logger logger = LoggerFactory.getLogger(GeneratePDF.class);
+    private final String outputDir = ConfigUtil.getProperty("output.dir");
+
+    /**
+     * Converts a list of modified Word documents to PDFs.
+     *
+     * @param modifiedFiles List of entries mapping ID to the path of the modified Word document
+     * @return List of entries mapping ID to PDF content as byte arrays
+     * @throws IOException if an I/O error occurs
+     */
+    public List<Map.Entry<String, byte[]>> convertToPDF(List<Map.Entry<String, String>> modifiedFiles) throws IOException {
+        List<Map.Entry<String, byte[]>> pdfContents = new ArrayList<>();
+
+        for (Map.Entry<String, String> entry : modifiedFiles) {
+            String id = entry.getKey();
+            String wordFilePath = entry.getValue();
+            File wordFile = new File(wordFilePath);
+            File pdfFile = new File(outputDir, id + ".pdf");
+
+            // Convert Word document to PDF
+            logger.debug("Converting Word document to PDF for ID: {}", id);
+            try {
+                WordprocessingMLPackage wordMLPackage = WordprocessingMLPackage.load(wordFile);
+
+                // Add font mapping to handle Aptos font and its variants
+                IdentityPlusMapper fontMapper = new IdentityPlusMapper();
+                fontMapper.put("Aptos", PhysicalFonts.get("Times New Roman"));
+                fontMapper.put("Aptos Display", PhysicalFonts.get("Times New Roman"));
+                fontMapper.put("Aptos Bold", PhysicalFonts.get("Times New Roman"));
+                fontMapper.put("Aptos Italic", PhysicalFonts.get("Times New Roman"));
+                fontMapper.put("Aptos Bold Italic", PhysicalFonts.get("Times New Roman"));
+                wordMLPackage.setFontMapper(fontMapper);
+
+                // Log to verify font mapper is applied
+                logger.debug("Applied font mapper for ID {}: Mapped Aptos to Times New Roman", id);
+
+                try (FileOutputStream os = new FileOutputStream(pdfFile)) {
+                    Docx4J.toPDF(wordMLPackage, os);
+                    os.flush();
+                }
+
+                // Verify the PDF file exists and is not empty
+                if (!pdfFile.exists() || pdfFile.length() == 0) {
+                    logger.error("PDF file for ID {} was not created or is empty at: {}", id, pdfFile.getAbsolutePath());
+                    throw new IOException("PDF file for ID " + id + " was not created or is empty");
+                }
+
+                // Read the PDF file into a byte array
+                logger.debug("Reading generated PDF into byte array for ID: {}", id);
+                byte[] pdfBytes = readFileToBytes(pdfFile);
+                pdfContents.add(new AbstractMap.SimpleEntry<>(id, pdfBytes));
+
+                logger.info("PDF generated successfully for ID {} at: {}", id, pdfFile.getAbsolutePath());
+            } catch (Exception e) {
+                logger.error("Error converting Word to PDF for ID {}: {}", id, e.getMessage(), e);
+                throw new IOException("Failed to convert Word to PDF for ID " + id, e);
+            } finally {
+                // Clean up the temporary Word and PDF files
+                if (wordFile.exists()) {
+                    if (wordFile.delete()) {
+                        logger.debug("Deleted temporary Word file: {}", wordFile.getAbsolutePath());
+                    } else {
+                        logger.warn("Failed to delete temporary Word file: {}", wordFile.getAbsolutePath());
+                    }
+                }
+                if (pdfFile.exists()) {
+                    if (pdfFile.delete()) {
+                        logger.debug("Deleted temporary PDF file: {}", pdfFile.getAbsolutePath());
+                    } else {
+                        logger.warn("Failed to delete temporary PDF file: {}", pdfFile.getAbsolutePath());
+                    }
+                }
+            }
+        }
+
+        return pdfContents;
+    }
+
+    /**
+     * Reads a file into a byte array.
+     *
+     * @param file the file to read
+     * @return the file contents as a byte array
+     * @throws IOException if an I/O error occurs
+     */
+    private byte[] readFileToBytes(File file) throws IOException {
+        try (FileInputStream fis = new FileInputStream(file)) {
+            byte[] bytes = new byte[(int) file.length()];
+            int bytesRead = fis.read(bytes);
+            if (bytesRead != file.length()) {
+                throw new IOException("Incomplete read of file: " + file.getAbsolutePath());
+            }
+            return bytes;
+        }
+    }
+}
